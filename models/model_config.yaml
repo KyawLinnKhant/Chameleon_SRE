@@ -1,0 +1,47 @@
+# Chameleon-SRE Model Configuration
+
+# Primary Model
+model:
+  name: "llama3.2:3b"
+  provider: "ollama"
+  base_url: "http://localhost:11434"
+
+# Generation Parameters
+generation:
+  temperature: 0.1          # Low for deterministic SRE tasks
+  top_p: 0.9
+  top_k: 40
+  max_tokens: 2048
+  context_window: 8192
+
+# Performance Tuning (Apple Silicon)
+performance:
+  num_gpu: 1
+  num_thread: 8
+  use_mmap: true
+  use_mlock: false
+
+# Tool Calling Configuration
+tools:
+  enabled: true
+  parallel_execution: false  # Execute tools sequentially
+  max_retries: 3
+
+# Safety & Guardrails
+safety:
+  max_tool_calls_per_iteration: 5
+  timeout_seconds: 300
+  require_confirmation_for:
+    - delete
+    - drain
+    - cordon
+    - scale_down
+
+# Alternative Models (for future use)
+alternatives:
+  - name: "llama3.2:1b"
+    use_case: "lightweight_testing"
+  - name: "mistral:7b"
+    use_case: "enhanced_reasoning"
+  - name: "codellama:13b"
+    use_case: "yaml_generation"
