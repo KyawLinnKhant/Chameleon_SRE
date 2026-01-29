@@ -273,10 +273,8 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ## 📧 Contact
 
-- **Author**: Senior MLOps Architect
+- **Author**: Kyaw Linn Khant
 - **Issues**: [GitHub Issues](https://github.com/yourusername/chameleon-sre/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/chameleon-sre/discussions)
 
 ---
-
-**Built with 🦎 on Apple Silicon**
