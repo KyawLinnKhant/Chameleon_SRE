@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # Chameleon-SRE Agent
+  chameleon-sre:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chameleon-sre
+    image: chameleon-sre:latest
+    
+    # Network mode: Use host network to access Ollama on localhost
+    network_mode: host
+    
+    # Volumes
+    volumes:
+      # Mount kubeconfig for cluster access
+      - ~/.kube:/root/.kube:ro
+      
+      # Persist ChromaDB data
+      - ./chroma_db:/app/chroma_db
+      
+      # Persist logs
+      - ./logs:/app/logs
+      
+      # Mount source for development (optional)
+      - ./src:/app/src:ro
+    
+    # Environment variables
+    environment:
+      - OLLAMA_BASE_URL=http://localhost:11434
+      - KUBECTL_PATH=/usr/bin/kubectl
+      - LANGCHAIN_TRACING_V2=false
+      - LOG_LEVEL=INFO
+    
+    # Resources (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Interactive mode
+    stdin_open: true
+    tty: true
+
+# Optional: Add Ollama service if you want to run it in Docker too
+# (Currently assumes Ollama runs on host machine)
+#  ollama:
+#    image: ollama/ollama:latest
+#    container_name: ollama
+#    ports:
+#      - "11434:11434"
+#    volumes:
+#      - ollama_data:/root/.ollama
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: 1
+#              capabilities: [gpu]
+
+#volumes:
+#  ollama_data:

@@ -1,39 +1,46 @@
 # Core Dependencies
-langchain==0.3.13
-langchain-ollama==0.2.3
-langgraph==0.2.63
-langsmith==0.2.7
-
-# LLM & Embeddings
-ollama==0.4.7
+langchain==0.1.20
+langchain-community==0.0.38
+langchain-ollama==0.0.3
+langgraph==0.0.55
+langsmith==0.1.55
 
 # Vector Database
-chromadb==0.5.23
-sentence-transformers==3.3.1
+chromadb==0.4.24
+sentence-transformers==2.6.1
 
 # Kubernetes Client
-kubernetes==31.0.0
+kubernetes==29.0.0
 
-# Configuration & Utilities
+# Apple Silicon Optimization
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+
+# Utilities
+pydantic==2.7.0
+pydantic-core==2.18.1
 python-dotenv==1.0.1
-pydantic==2.10.6
-pydantic-settings==2.7.0
-pyyaml==6.0.2
+tiktoken==0.6.0
+tenacity==8.2.3
 
-# Data Processing
-numpy==1.26.4
-pandas==2.2.3
-
-# Logging & Monitoring
-loguru==0.7.3
+# Document Processing
+pypdf==4.1.0
+beautifulsoup4==4.12.3
+lxml==5.2.1
+markdown==3.6
 
 # Testing
-pytest==8.3.4
-pytest-asyncio==0.24.0
-pytest-cov==6.0.0
+pytest==8.1.1
+pytest-asyncio==0.23.6
+pytest-cov==5.0.0
 
-# Type Hints
-typing-extensions==4.12.2
+# Development
+black==24.3.0
+ruff==0.3.5
+mypy==1.9.0
+ipython==8.23.0
 
-# Optional: Apple Silicon optimization
-# torch==2.5.1  # Uncomment if using local embeddings on MPS
+# Observability
+opentelemetry-api==1.24.0
+opentelemetry-sdk==1.24.0

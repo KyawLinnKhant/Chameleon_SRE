@@ -1,178 +1,125 @@
 """
-Configuration management for Chameleon-SRE.
-Handles environment detection, settings, and hardware optimization.
+Configuration module for Chameleon-SRE
+Handles hardware detection, model settings, and environment configuration
 """
 
 import os
 import platform
-from pathlib import Path
 from typing import Literal
 
-from dotenv import load_dotenv
-from pydantic import Field
-from pydantic_settings import BaseSettings
-
-# Load environment variables
-load_dotenv()
+import torch
 
 
-class Settings(BaseSettings):
-    """Application settings with environment variable support."""
-
-    # Ollama Configuration
-    ollama_host: str = Field(
-        default="http://localhost:11434", 
-        validation_alias="OLLAMA_HOST"
-    )
-    ollama_model: str = Field(
-        default="llama3.2:3b", 
-        validation_alias="OLLAMA_MODEL"
-    )
-
-    # LangSmith Tracing
-    langchain_tracing: bool = Field(
-        default=False, 
-        validation_alias="LANGCHAIN_TRACING_V2"
-    )
-    langchain_api_key: str | None = Field(
-        default=None, 
-        validation_alias="LANGCHAIN_API_KEY"
-    )
-    langchain_project: str = Field(
-        default="chameleon-sre", 
-        validation_alias="LANGCHAIN_PROJECT"
-    )
-    langchain_endpoint: str = "https://api.smith.langchain.com"
-
-    # Hardware Configuration
-    device: Literal["auto", "mps", "cuda", "cpu"] = Field(
-        default="auto", 
-        validation_alias="DEVICE"
-    )
-    use_gpu: bool = Field(
-        default=True, 
-        validation_alias="USE_GPU"
-    )
-
-    # ChromaDB
-    chroma_db_path: str = Field(
-        default="./data/chroma_db", 
-        validation_alias="CHROMA_DB_PATH"
-    )
-    chroma_collection_name: str = Field(
-        default="k8s_docs", 
-        validation_alias="CHROMA_COLLECTION_NAME"
-    )
-
-    # Agent Configuration
-    max_iterations: int = Field(
-        default=10, 
-        validation_alias="MAX_ITERATIONS"
-    )
-    timeout_seconds: int = Field(
-        default=300, 
-        validation_alias="TIMEOUT_SECONDS"
-    )
-    verbose: bool = Field(
-        default=True, 
-        validation_alias="VERBOSE"
-    )
-
-    # Kubernetes
-    kubeconfig: str = Field(
-        default="~/.kube/config", 
-        validation_alias="KUBECONFIG"
-    )
-    k8s_namespace: str = Field(
-        default="default", 
-        validation_alias="K8S_NAMESPACE"
-    )
-
-    # Safety
-    allow_destructive_commands: bool = Field(
-        default=False, 
-        validation_alias="ALLOW_DESTRUCTIVE_COMMANDS"
-    )
-    dry_run_mode: bool = Field(
-        default=False, 
-        validation_alias="DRY_RUN_MODE"
-    )
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
-
-
-def get_device() -> str:
+def get_device() -> Literal["mps", "cuda", "cpu"]:
     """
-    Auto-detect the best available hardware device.
+    Auto-detect optimal compute device for inference
     
     Returns:
-        str: Device identifier ("mps", "cuda", or "cpu")
+        "mps" for Apple Silicon
+        "cuda" for NVIDIA GPUs
+        "cpu" as fallback
     """
-    settings = Settings()
-
-    if settings.device != "auto":
-        return settings.device
-
-    if not settings.use_gpu:
-        return "cpu"
-
-    # Check for Apple Silicon (M1/M2/M3)
-    if platform.system() == "Darwin" and platform.machine() == "arm64":
-        try:
-            import torch
-            if torch.backends.mps.is_available():
-                return "mps"
-        except ImportError:
-            pass
-
-    # Check for NVIDIA CUDA
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda"
-    except ImportError:
-        pass
-
+    if torch.backends.mps.is_available():
+        return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
     return "cpu"
 
 
-def get_project_root() -> Path:
-    """Get the project root directory."""
-    return Path(__file__).parent.parent
-
-
-def ensure_directories() -> None:
-    """Create necessary directories if they don't exist."""
-    root = get_project_root()
-    directories = [
-        root / "data" / "chroma_db",
-        root / "data" / "processed",
-        root / "data" / "raw",
-        root / "data" / "runbooks",
-    ]
+def get_device_info() -> dict:
+    """Get detailed device information"""
+    device = get_device()
+    info = {
+        "device": device,
+        "platform": platform.system(),
+        "machine": platform.machine(),
+        "python_version": platform.python_version(),
+    }
     
-    for directory in directories:
-        directory.mkdir(parents=True, exist_ok=True)
+    if device == "cuda":
+        info["gpu_name"] = torch.cuda.get_device_name(0)
+        info["gpu_memory"] = f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB"
+    elif device == "mps":
+        info["gpu_name"] = "Apple Metal Performance Shaders"
+    
+    return info
 
 
-# Global settings instance
-settings = Settings()
+# Ollama Configuration
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.2")
 
-# Ensure directories exist on import
-ensure_directories()
+# Agent Configuration
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))  # Deterministic for SRE tasks
+MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "10"))
+
+# Kubernetes Configuration
+KUBECTL_PATH = os.getenv("KUBECTL_PATH", "kubectl")
+DEFAULT_NAMESPACE = os.getenv("K8S_NAMESPACE", "default")
+
+# ChromaDB Configuration
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+
+# LangSmith Configuration (Observability)
+LANGCHAIN_TRACING_V2 = os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY", "")
+LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", "chameleon-sre")
+
+# Voice Alert Configuration
+ENABLE_VOICE_ALERTS = os.getenv("ENABLE_VOICE_ALERTS", "true").lower() == "true"
+
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+
+# System Prompt for SRE Agent
+SYSTEM_PROMPT = """You are Chameleon-SRE, an autonomous Site Reliability Engineer.
+
+**Core Responsibilities:**
+1. Monitor Kubernetes cluster health
+2. Diagnose infrastructure issues
+3. Execute safe remediation actions
+4. Learn from historical incidents
+
+**Operational Guidelines:**
+- ALWAYS verify cluster state before actions
+- NEVER delete resources without explicit confirmation
+- Use RAG knowledge base for troubleshooting
+- Retry failed operations with exponential backoff
+- Alert engineers for critical issues
+- Document all actions in conversation history
+
+**Available Tools:**
+- execute_k8s_command: Run kubectl commands (READ-ONLY by default)
+- read_rag_docs: Search knowledge base for solutions
+- system_voice_alert: Notify engineer via voice
+
+**Decision Framework:**
+1. OBSERVE: Gather current cluster state
+2. ANALYZE: Compare against expected state
+3. SEARCH: Query knowledge base for similar issues
+4. ACT: Execute minimal corrective action
+5. VERIFY: Confirm resolution
+6. DOCUMENT: Update incident log
+
+You reason in loops, not chains. If an action fails, you see the error and adapt.
+Be precise, cautious, and always prioritize cluster stability over speed.
+"""
 
 
 if __name__ == "__main__":
-    print("🔧 Chameleon-SRE Configuration")
-    print("=" * 50)
-    print(f"Ollama Host: {settings.ollama_host}")
-    print(f"Ollama Model: {settings.ollama_model}")
-    print(f"Device: {get_device()}")
-    print(f"ChromaDB Path: {settings.chroma_db_path}")
-    print(f"Max Iterations: {settings.max_iterations}")
-    print(f"Verbose: {settings.verbose}")
-    print(f"Dry Run Mode: {settings.dry_run_mode}")
-    print("=" * 50)
+    print("🦎 Chameleon-SRE Configuration")
+    print("=" * 60)
+    
+    device_info = get_device_info()
+    for key, value in device_info.items():
+        print(f"{key:20s}: {value}")
+    
+    print(f"\n{'Model':20s}: {MODEL_NAME}")
+    print(f"{'Ollama URL':20s}: {OLLAMA_BASE_URL}")
+    print(f"{'Chroma DB':20s}: {CHROMA_PERSIST_DIR}")
+    print(f"{'LangSmith':20s}: {'Enabled' if LANGCHAIN_TRACING_V2 else 'Disabled'}")

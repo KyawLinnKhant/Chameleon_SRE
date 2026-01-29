@@ -1,91 +1,114 @@
 """
-State definitions for LangGraph agent.
-Defines the AgentState that tracks conversation history and execution context.
+State management for LangGraph agent
+Defines the memory structure that persists across reasoning loops
 """
 
-from typing import Annotated, TypedDict
-
-from langgraph.graph.message import add_messages
+from typing import List, TypedDict, Annotated
+from operator import add
 
 
 class AgentState(TypedDict):
     """
-    State schema for the Chameleon-SRE agent.
+    State that persists across agent reasoning iterations
     
-    This state is maintained across all nodes in the LangGraph state machine.
-    The 'add_messages' reducer ensures messages are appended rather than replaced.
+    This is the "memory" of the agent - it accumulates context
+    as it loops through Think → Act → Observe cycles
     """
     
-    # Conversation history (automatic message accumulation)
-    messages: Annotated[list, add_messages]
+    # Conversation history (messages from user and agent)
+    messages: Annotated[List[dict], add]
     
-    # Execution context
+    # Current task the agent is working on
+    current_task: str
+    
+    # Kubernetes cluster state snapshot
+    cluster_state: dict
+    
+    # Error log from failed operations
+    error_log: List[str]
+    
+    # Number of iterations in current reasoning loop
     iteration_count: int
-    error_log: list[str]
-    last_tool_output: str | None
     
-    # Task tracking
-    task_completed: bool
-    requires_human_intervention: bool
+    # Flag to indicate if task is complete
+    task_complete: bool
     
-    # Kubernetes context
-    current_namespace: str
-    affected_resources: list[str]
+    # Last tool output (for verification loops)
+    last_tool_output: str
+    
+    # RAG search results
+    knowledge_context: List[dict]
 
 
-def create_initial_state(namespace: str = "default") -> AgentState:
+def create_initial_state(user_input: str) -> AgentState:
     """
-    Create a fresh agent state for a new conversation.
+    Initialize agent state for a new task
     
     Args:
-        namespace: Kubernetes namespace to operate in
-        
+        user_input: The user's request/query
+    
     Returns:
-        AgentState: Initial state with empty values
+        Fresh AgentState with default values
     """
     return AgentState(
-        messages=[],
-        iteration_count=0,
+        messages=[{"role": "user", "content": user_input}],
+        current_task=user_input,
+        cluster_state={},
         error_log=[],
-        last_tool_output=None,
-        task_completed=False,
-        requires_human_intervention=False,
-        current_namespace=namespace,
-        affected_resources=[],
+        iteration_count=0,
+        task_complete=False,
+        last_tool_output="",
+        knowledge_context=[]
     )
 
 
 def should_continue(state: AgentState, max_iterations: int = 10) -> bool:
     """
-    Determine if the agent should continue executing.
+    Determine if the agent should continue reasoning loop
     
     Args:
         state: Current agent state
         max_iterations: Maximum allowed iterations
-        
+    
     Returns:
-        bool: True if agent should continue, False otherwise
+        True if agent should continue, False if should stop
     """
-    # Stop if task is complete
-    if state["task_completed"]:
+    if state["task_complete"]:
         return False
     
-    # Stop if human intervention is needed
-    if state["requires_human_intervention"]:
-        return False
-    
-    # Stop if max iterations reached
     if state["iteration_count"] >= max_iterations:
+        return False
+    
+    # Stop if too many consecutive errors
+    if len(state["error_log"]) >= 5:
         return False
     
     return True
 
 
-if __name__ == "__main__":
-    # Test state creation
-    state = create_initial_state("production")
-    print("Initial State:")
-    print(f"  Namespace: {state['current_namespace']}")
-    print(f"  Iteration Count: {state['iteration_count']}")
-    print(f"  Task Completed: {state['task_completed']}")
-    print(f"  Should Continue: {should_continue(state)}")
+def format_state_for_display(state: AgentState) -> str:
+    """
+    Format state into human-readable string for debugging
+    
+    Args:
+        state: Current agent state
+    
+    Returns:
+        Formatted string representation
+    """
+    output = []
+    output.append("=" * 60)
+    output.append(f"Task: {state['current_task']}")
+    output.append(f"Iteration: {state['iteration_count']}")
+    output.append(f"Complete: {state['task_complete']}")
+    
+    if state["error_log"]:
+        output.append(f"Errors: {len(state['error_log'])}")
+        output.append("  " + "\n  ".join(state["error_log"][-3:]))  # Last 3 errors
+    
+    if state["knowledge_context"]:
+        output.append(f"Knowledge Articles: {len(state['knowledge_context'])}")
+    
+    output.append("=" * 60)
+    
+    return "\n".join(output)

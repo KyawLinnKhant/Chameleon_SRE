@@ -1,0 +1,111 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chameleon-sre
+  namespace: default
+  labels:
+    app: chameleon-sre
+spec:
+  replicas: 1  # Single agent instance
+  selector:
+    matchLabels:
+      app: chameleon-sre
+  template:
+    metadata:
+      labels:
+        app: chameleon-sre
+    spec:
+      serviceAccountName: chameleon-sre
+      
+      # Init container to setup ChromaDB
+      initContainers:
+        - name: setup-rag
+          image: chameleon-sre:v1
+          command: ["python", "scripts/ingest_docs.py"]
+          volumeMounts:
+            - name: chroma-storage
+              mountPath: /app/chroma_db
+          envFrom:
+            - configMapRef:
+                name: chameleon-sre-config
+      
+      containers:
+        - name: agent
+          image: chameleon-sre:v1
+          imagePullPolicy: IfNotPresent
+          
+          # Command: Run in non-interactive mode (batch processing)
+          # For interactive, use: ["python", "src/main.py"]
+          command: ["python", "src/main.py", "--no-interactive"]
+          
+          # Environment variables from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: chameleon-sre-config
+          
+          # Volume mounts
+          volumeMounts:
+            - name: chroma-storage
+              mountPath: /app/chroma_db
+            - name: logs
+              mountPath: /app/logs
+          
+          # Resource limits
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          
+          # Health checks
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import sys; sys.exit(0)"
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import sys; sys.exit(0)"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+      
+      # Volumes
+      volumes:
+        - name: chroma-storage
+          persistentVolumeClaim:
+            claimName: chameleon-sre-pvc
+        - name: logs
+          emptyDir: {}
+      
+      # Restart policy
+      restartPolicy: Always
+
+---
+# PersistentVolumeClaim for ChromaDB storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chameleon-sre-pvc
+  namespace: default
+  labels:
+    app: chameleon-sre
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: standard  # Uncomment for specific storage class

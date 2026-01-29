@@ -1,283 +1,283 @@
 """
-Tool definitions for the Chameleon-SRE agent.
-Updated with real RAG integration.
+Tool definitions for the Chameleon-SRE agent
+Each tool is a function the agent can call to interact with the world
 """
 
+import os
+import re
 import subprocess
-from typing import Annotated
+from typing import List, Dict, Any
+import logging
 
 from langchain_core.tools import tool
-from loguru import logger
+from chromadb import PersistentClient
+from chromadb.utils import embedding_functions
 
-from src.config import settings
-from src.utils import sanitize_command, format_kubectl_output, extract_error_message
+from .config import (
+    KUBECTL_PATH,
+    DEFAULT_NAMESPACE,
+    CHROMA_PERSIST_DIR,
+    EMBEDDING_MODEL,
+    ENABLE_VOICE_ALERTS
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Kubernetes Tools
+# ============================================================================
+
+def validate_kubectl_command(cmd: str) -> bool:
+    """
+    Validate kubectl command to prevent dangerous operations
+    
+    Args:
+        cmd: The kubectl command to validate
+    
+    Returns:
+        True if safe, False if potentially dangerous
+    """
+    dangerous_patterns = [
+        r"delete\s+namespace",  # Don't allow namespace deletion
+        r"delete\s+.*\s+--all",  # Don't allow bulk deletion
+        r"&&",  # No command chaining
+        r"\|",  # No piping
+        r";",   # No command separation
+        r"`",   # No command substitution
+        r"\$\(",  # No command substitution
+    ]
+    
+    for pattern in dangerous_patterns:
+        if re.search(pattern, cmd, re.IGNORECASE):
+            logger.warning(f"Blocked dangerous command: {cmd}")
+            return False
+    
+    return True
 
 
 @tool
-def execute_k8s_command(
-    command: Annotated[str, "The kubectl command to execute (e.g., 'kubectl get pods')"]
-) -> str:
+def execute_k8s_command(command: str, namespace: str = DEFAULT_NAMESPACE) -> str:
     """
-    Execute a kubectl command and return the output.
-    
-    This tool provides safe access to Kubernetes operations with built-in
-    validation and safety checks. Destructive commands require explicit permission.
+    Execute a kubectl command safely
     
     Args:
-        command: The kubectl command to run
-        
+        command: kubectl command (without 'kubectl' prefix)
+        namespace: Kubernetes namespace (default from config)
+    
     Returns:
-        str: Command output or error message
-        
+        Command output or error message
+    
     Examples:
-        >>> execute_k8s_command("kubectl get pods -n default")
-        >>> execute_k8s_command("kubectl describe pod myapp-xyz")
-        >>> execute_k8s_command("kubectl logs myapp-xyz --tail=50")
+        execute_k8s_command("get pods")
+        execute_k8s_command("describe pod nginx-abc123", namespace="production")
     """
-    logger.info(f"Executing K8s command: {command}")
+    # Construct full command
+    full_command = f"{KUBECTL_PATH} {command}"
+    
+    # Add namespace if not already specified and command needs it
+    if "-n " not in command and "--namespace" not in command:
+        if any(x in command for x in ["get", "describe", "logs", "exec"]):
+            full_command += f" -n {namespace}"
+    
+    # Security validation
+    if not validate_kubectl_command(full_command):
+        return "ERROR: Command blocked for security reasons. Avoid delete, piping, or command chaining."
     
     try:
-        # Sanitize command
-        safe_command = sanitize_command(command)
-        
-        # Add dry-run flag if enabled
-        if settings.dry_run_mode and "get" not in command.lower():
-            safe_command += " --dry-run=client"
-            logger.warning("DRY RUN MODE: Command will not be executed")
-        
-        # Execute command
+        logger.info(f"Executing: {full_command}")
         result = subprocess.run(
-            safe_command,
+            full_command,
             shell=True,
             capture_output=True,
             text=True,
-            timeout=settings.timeout_seconds,
+            timeout=30
         )
         
-        # Check for errors
-        if result.returncode != 0:
-            error_msg = result.stderr or "Unknown error"
-            logger.error(f"Command failed: {error_msg}")
-            return f"❌ Error: {error_msg}"
-        
-        # Format and return output
-        output = result.stdout or "Command executed successfully (no output)"
-        formatted_output = format_kubectl_output(output)
-        
-        logger.success(f"Command succeeded (output: {len(output)} chars)")
-        return formatted_output
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            return f"ERROR (exit {result.returncode}): {result.stderr}"
     
     except subprocess.TimeoutExpired:
-        error_msg = f"Command timed out after {settings.timeout_seconds} seconds"
-        logger.error(error_msg)
-        return f"❌ {error_msg}"
-    
-    except ValueError as e:
-        # Dangerous command blocked
-        logger.warning(f"Command blocked: {e}")
-        return f"❌ {str(e)}"
-    
+        return "ERROR: Command timed out after 30 seconds"
     except Exception as e:
-        error_msg = extract_error_message(e)
-        logger.error(f"Unexpected error: {error_msg}")
-        return f"❌ Unexpected error: {error_msg}"
+        return f"ERROR: {str(e)}"
 
 
 @tool
-def get_pod_status(
-    namespace: Annotated[str, "Kubernetes namespace"] = "default",
-    label_selector: Annotated[str | None, "Label selector (e.g., 'app=nginx')"] = None,
-) -> str:
+def get_pod_logs(pod_name: str, namespace: str = DEFAULT_NAMESPACE, tail: int = 100) -> str:
     """
-    Get the status of pods in a namespace with optional label filtering.
-    
-    This is a convenience wrapper around kubectl that provides structured output.
-    
-    Args:
-        namespace: Kubernetes namespace to query
-        label_selector: Optional label selector to filter pods
-        
-    Returns:
-        str: Pod status information
-        
-    Examples:
-        >>> get_pod_status("production")
-        >>> get_pod_status("default", "app=nginx")
-    """
-    command = f"kubectl get pods -n {namespace}"
-    
-    if label_selector:
-        command += f" -l {label_selector}"
-    
-    command += " -o wide"
-    
-    return execute_k8s_command(command)
-
-
-@tool
-def read_pod_logs(
-    pod_name: Annotated[str, "Name of the pod"],
-    namespace: Annotated[str, "Kubernetes namespace"] = "default",
-    tail: Annotated[int, "Number of lines to show from end"] = 50,
-    container: Annotated[str | None, "Container name (for multi-container pods)"] = None,
-) -> str:
-    """
-    Read logs from a Kubernetes pod.
+    Get logs from a Kubernetes pod
     
     Args:
         pod_name: Name of the pod
         namespace: Kubernetes namespace
-        tail: Number of lines to retrieve from the end
-        container: Optional container name for multi-container pods
-        
+        tail: Number of recent lines to retrieve
+    
     Returns:
-        str: Pod logs
-        
-    Examples:
-        >>> read_pod_logs("myapp-xyz", "production", tail=100)
-        >>> read_pod_logs("myapp-xyz", "production", container="sidecar")
+        Pod logs or error message
     """
-    command = f"kubectl logs {pod_name} -n {namespace} --tail={tail}"
-    
-    if container:
-        command += f" -c {container}"
-    
-    return execute_k8s_command(command)
+    return execute_k8s_command(
+        f"logs {pod_name} --tail={tail}",
+        namespace=namespace
+    )
 
 
 @tool
-def describe_resource(
-    resource_type: Annotated[str, "Resource type (e.g., 'pod', 'service', 'deployment')"],
-    resource_name: Annotated[str, "Name of the resource"],
-    namespace: Annotated[str, "Kubernetes namespace"] = "default",
-) -> str:
+def restart_deployment(deployment_name: str, namespace: str = DEFAULT_NAMESPACE) -> str:
     """
-    Get detailed information about a Kubernetes resource.
+    Restart a Kubernetes deployment (creates new pods)
     
     Args:
-        resource_type: Type of resource (pod, service, deployment, etc.)
-        resource_name: Name of the resource
+        deployment_name: Name of the deployment
         namespace: Kubernetes namespace
-        
+    
     Returns:
-        str: Detailed resource information
-        
-    Examples:
-        >>> describe_resource("pod", "myapp-xyz", "production")
-        >>> describe_resource("service", "api-service", "default")
+        Status message
     """
-    command = f"kubectl describe {resource_type} {resource_name} -n {namespace}"
-    return execute_k8s_command(command)
+    return execute_k8s_command(
+        f"rollout restart deployment/{deployment_name}",
+        namespace=namespace
+    )
+
+
+# ============================================================================
+# RAG (Retrieval-Augmented Generation) Tools
+# ============================================================================
+
+def get_chroma_client():
+    """Get or create ChromaDB client"""
+    try:
+        client = PersistentClient(path=CHROMA_PERSIST_DIR)
+        return client
+    except Exception as e:
+        logger.error(f"Failed to connect to ChromaDB: {e}")
+        return None
 
 
 @tool
-def read_rag_docs(
-    query: Annotated[str, "Search query for documentation"]
-) -> str:
+def read_rag_docs(query: str, top_k: int = 3) -> str:
     """
-    Search the RAG knowledge base for relevant Kubernetes documentation.
-    
-    This tool retrieves relevant documentation snippets based on semantic similarity
-    to help the agent make informed decisions.
+    Search the knowledge base for relevant documentation
     
     Args:
-        query: Natural language query describing what you need to know
-        
+        query: Search query (e.g., "CrashLoopBackOff troubleshooting")
+        top_k: Number of top results to return
+    
     Returns:
-        str: Relevant documentation excerpts
-        
+        Formatted search results with relevant documentation
+    
     Examples:
-        >>> read_rag_docs("How do I troubleshoot ImagePullBackOff errors?")
-        >>> read_rag_docs("What are best practices for resource limits?")
+        read_rag_docs("how to fix ImagePullBackOff")
+        read_rag_docs("redis configuration best practices")
     """
-    logger.info(f"RAG query: {query}")
+    client = get_chroma_client()
+    
+    if client is None:
+        return "ERROR: Knowledge base not available. Run 'python scripts/ingest_docs.py' first."
     
     try:
-        # Import here to avoid circular dependency
-        from rag.retriever import get_retriever
+        # Get the collection
+        collection = client.get_collection(
+            name="k8s_docs",
+            embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=EMBEDDING_MODEL
+            )
+        )
         
-        # Get retriever and search
-        retriever = get_retriever()
-        documents = retriever.retrieve(query, top_k=3)
+        # Query the collection
+        results = collection.query(
+            query_texts=[query],
+            n_results=top_k
+        )
         
-        if not documents:
-            return "📚 No relevant documentation found. Try rephrasing your query."
+        if not results["documents"] or not results["documents"][0]:
+            return f"No relevant documentation found for: {query}"
         
         # Format results
-        context = retriever.format_context(documents, max_length=1500)
+        output = [f"📚 Knowledge Base Results for: {query}\n"]
         
-        logger.success(f"Retrieved {len(documents)} relevant documents")
-        return context
+        for i, (doc, metadata) in enumerate(zip(results["documents"][0], results["metadatas"][0]), 1):
+            source = metadata.get("source", "Unknown")
+            output.append(f"\n--- Result {i} (Source: {source}) ---")
+            output.append(doc[:500])  # First 500 chars
+            if len(doc) > 500:
+                output.append("... [truncated]")
         
+        return "\n".join(output)
+    
     except Exception as e:
-        logger.error(f"RAG query failed: {e}")
-        # Fallback to helpful message
-        return f"""📚 Documentation search unavailable: {str(e)}
+        logger.error(f"RAG search failed: {e}")
+        return f"ERROR: Failed to search knowledge base: {str(e)}"
 
-💡 Tip: Run the ingestion script first:
-   python scripts/ingest_docs.py
 
-For now, here are general troubleshooting steps:
-1. Check pod status: kubectl get pods
-2. Describe the pod: kubectl describe pod <pod-name>
-3. Check logs: kubectl logs <pod-name>
-4. Look for common issues: ImagePullBackOff, CrashLoopBackOff, Pending
-"""
-
+# ============================================================================
+# Alert & Notification Tools
+# ============================================================================
 
 @tool
-def system_voice_alert(
-    message: Annotated[str, "Critical message to announce to the engineer"]
-) -> str:
+def system_voice_alert(message: str, severity: str = "warning") -> str:
     """
-    Send a voice alert to notify the engineer of critical findings.
-    
-    Use this sparingly - only for truly critical issues that require immediate attention.
+    Send voice alert to engineer (macOS 'say' command or system notification)
     
     Args:
-        message: The message to announce
-        
-    Returns:
-        str: Confirmation of alert sent
-        
-    Examples:
-        >>> system_voice_alert("Critical: All pods in production namespace are failing!")
-    """
-    logger.critical(f"🔊 VOICE ALERT: {message}")
+        message: Alert message to speak
+        severity: "info", "warning", or "critical"
     
-    # On macOS, use 'say' command for TTS
+    Returns:
+        Confirmation message
+    
+    Examples:
+        system_voice_alert("Pod nginx is in CrashLoopBackOff", severity="critical")
+    """
+    if not ENABLE_VOICE_ALERTS:
+        return f"Voice alerts disabled. Would have said: {message}"
+    
     try:
-        subprocess.run(
-            ["say", message],
-            timeout=10,
-            capture_output=True,
-        )
-        return f"✅ Voice alert sent: {message}"
+        # Try macOS 'say' command
+        if os.system("which say > /dev/null 2>&1") == 0:
+            voice = {
+                "info": "Samantha",
+                "warning": "Alex",
+                "critical": "Victoria"
+            }.get(severity, "Alex")
+            
+            subprocess.run(
+                ["say", "-v", voice, message],
+                check=True,
+                timeout=10
+            )
+            return f"✅ Voice alert sent: {message}"
+        else:
+            # Fallback: print to console
+            severity_emoji = {
+                "info": "ℹ️",
+                "warning": "⚠️",
+                "critical": "🚨"
+            }.get(severity, "⚠️")
+            
+            print(f"\n{severity_emoji} ALERT: {message}\n")
+            return f"✅ Console alert sent: {message}"
+    
     except Exception as e:
-        logger.warning(f"Voice alert failed: {e}")
-        return f"⚠️ Voice alert unavailable (logged instead): {message}"
+        logger.error(f"Voice alert failed: {e}")
+        return f"ERROR: Failed to send alert: {str(e)}"
 
 
-# Export all tools as a list
-AGENT_TOOLS = [
+# ============================================================================
+# Tool Registry (for LangGraph)
+# ============================================================================
+
+ALL_TOOLS = [
     execute_k8s_command,
-    get_pod_status,
-    read_pod_logs,
-    describe_resource,
+    get_pod_logs,
+    restart_deployment,
     read_rag_docs,
     system_voice_alert,
 ]
 
 
-if __name__ == "__main__":
-    from src.utils import setup_logging
-    
-    setup_logging(verbose=True)
-    
-    # Test tools
-    print("\n=== Testing Tools ===\n")
-    
-    # Test RAG
-    print("Testing RAG...")
-    result = read_rag_docs.invoke({"query": "ImagePullBackOff troubleshooting"})
-    print(f"RAG result: {result[:200]}...")
+def get_tools() -> List:
+    """Get all available tools for the agent"""
+    return ALL_TOOLS

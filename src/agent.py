@@ -1,241 +1,269 @@
 """
-Simplified agent - executes one action and stops.
-Much faster for simple queries.
+Core agent logic using LangGraph
+Implements a cyclic reasoning loop: Think → Act → Observe → Reflect
 """
 
+import logging
 from typing import Literal
-import re
-import warnings
 
-warnings.filterwarnings('ignore', category=DeprecationWarning)
-
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, END
-from loguru import logger
+from langgraph.prebuilt import ToolNode
 
-from src.config import settings
-from src.state import AgentState, create_initial_state
-from src.tools import (
-    execute_k8s_command,
-    get_pod_status,
-    read_pod_logs,
-    describe_resource,
-    read_rag_docs
+from .config import (
+    OLLAMA_BASE_URL,
+    MODEL_NAME,
+    TEMPERATURE,
+    MAX_ITERATIONS,
+    SYSTEM_PROMPT
 )
-from src.utils import setup_logging
-from models.ollama_client import get_llm
+from .state import AgentState, should_continue
+from .tools import get_tools
+
+logger = logging.getLogger(__name__)
 
 
-SIMPLE_PROMPT = """You are Chameleon-SRE, a Kubernetes assistant.
+# ============================================================================
+# LangGraph Nodes
+# ============================================================================
 
-When the user asks a question, you will:
-1. Execute ONE action to get the information
-2. Analyze the result
-3. Give a brief answer
-4. STOP (do not execute more actions unless there's an error)
-
-Actions (use EXACTLY this format):
-ACTION: kubectl
-INPUT: get pods
-
-ACTION: describe  
-INPUT: pod nginx default
-
-ACTION: logs
-INPUT: nginx default
-
-ACTION: search_docs
-INPUT: what causes ImagePullBackOff
-
-CRITICAL: After you see OBSERVATION with results, immediately provide your FINAL ANSWER. Do NOT execute another action unless the first one failed.
-"""
-
-
-def parse_action(text: str) -> tuple[str | None, str | None]:
-    """Parse ACTION and INPUT."""
-    action_match = re.search(r'ACTION:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if not action_match:
-        return None, None
+def agent_node(state: AgentState) -> AgentState:
+    """
+    Main reasoning node where the agent thinks and decides what to do
     
-    action = action_match.group(1).strip()
-    input_match = re.search(r'INPUT:\s*(.+?)(?:\n|OBSERVATION|$)', text, re.IGNORECASE | re.DOTALL)
-    input_text = input_match.group(1).strip() if input_match else ""
+    This node:
+    1. Receives the current state
+    2. Calls the LLM to decide next action
+    3. Updates state with new messages
+    """
+    logger.info(f"Agent thinking (iteration {state['iteration_count']})...")
     
-    return action, input_text
-
-
-def execute_action(action: str, input_text: str) -> str:
-    """Execute action."""
+    # Initialize LLM with tool binding
+    llm = ChatOllama(
+        base_url=OLLAMA_BASE_URL,
+        model=MODEL_NAME,
+        temperature=TEMPERATURE
+    )
+    
+    tools = get_tools()
+    llm_with_tools = llm.bind_tools(tools)
+    
+    # Build message history
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    
+    # Add context from RAG if available
+    if state["knowledge_context"]:
+        context_msg = "\n\n".join([
+            f"📚 Knowledge Base Context:\n{doc['content']}"
+            for doc in state["knowledge_context"][:2]  # Top 2 results
+        ])
+        messages.append(SystemMessage(content=context_msg))
+    
+    # Call LLM
     try:
-        action_lower = action.lower()
+        response = llm_with_tools.invoke(messages)
         
-        if action_lower == 'kubectl':
-            full_command = f"kubectl {input_text}" if input_text else "kubectl get pods"
-            logger.info(f"Executing: {full_command}")
-            return execute_k8s_command.invoke({"command": full_command})
-            
-        elif action_lower in ['describe', 'describe_resource']:
-            parts = input_text.split()
-            if len(parts) < 2:
-                return "❌ Format: describe <type> <name> [namespace]"
-            return describe_resource.invoke({
-                "resource_type": parts[0],
-                "resource_name": parts[1],
-                "namespace": parts[2] if len(parts) > 2 else "default"
-            })
-            
-        elif action_lower in ['logs', 'read_logs']:
-            parts = input_text.split()
-            if not parts:
-                return "❌ Format: logs <pod-name> [namespace]"
-            return read_pod_logs.invoke({
-                "pod_name": parts[0],
-                "namespace": parts[1] if len(parts) > 1 else "default",
-                "tail": 50
-            })
-            
-        elif action_lower in ['search_docs', 'docs']:
-            return read_rag_docs.invoke({"query": input_text or "kubernetes"})
-            
-        else:
-            return f"❌ Unknown action. Use: kubectl, describe, logs, search_docs"
+        # Update state
+        state["messages"].append(response)
+        state["iteration_count"] += 1
         
+        # Check if agent wants to finish
+        if not response.tool_calls:
+            # No more tools to call - task might be complete
+            content = response.content.lower()
+            if any(keyword in content for keyword in ["complete", "done", "finished", "resolved"]):
+                state["task_complete"] = True
+        
+        return state
+    
     except Exception as e:
-        return f"❌ Error: {e}"
+        logger.error(f"Agent node error: {e}")
+        state["error_log"].append(f"Agent reasoning failed: {str(e)}")
+        state["messages"].append(AIMessage(
+            content=f"I encountered an error while thinking: {str(e)}. Let me try a different approach."
+        ))
+        return state
 
 
-def create_simple_graph() -> StateGraph:
-    """Create simple graph."""
+def tool_node(state: AgentState) -> AgentState:
+    """
+    Execute tools requested by the agent
     
-    graph = StateGraph(AgentState)
-    llm = get_llm()
+    This node:
+    1. Extracts tool calls from last message
+    2. Executes each tool
+    3. Adds results back to state
+    """
+    logger.info("Executing tools...")
     
-    def agent_node(state: AgentState) -> AgentState:
-        """Agent node."""
-        iteration = state["iteration_count"]
+    last_message = state["messages"][-1]
+    
+    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+        return state
+    
+    tools = {tool.name: tool for tool in get_tools()}
+    
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
         
-        # First iteration - execute action
-        if iteration == 0:
-            messages = [SystemMessage(content=SIMPLE_PROMPT)] + state["messages"]
-            response = llm.invoke(messages)
-            
-            action, input_params = parse_action(response.content)
-            
-            if action:
-                logger.info(f"Action: {action} {input_params}")
-                observation = execute_action(action, input_params)
-                
-                # Ask for final answer
-                obs_msg = HumanMessage(
-                    content=f"OBSERVATION: {observation}\n\nProvide your final answer now (do not execute more actions)."
-                )
-                
-                return {
-                    **state,
-                    "messages": [response, obs_msg],
-                    "iteration_count": 1,
-                }
-            else:
-                # No action needed, direct answer
-                return {
-                    **state,
-                    "messages": [response],
-                    "iteration_count": 1,
-                    "task_completed": True,
-                }
+        logger.info(f"Calling tool: {tool_name} with args: {tool_args}")
         
-        # Second iteration - final answer only
-        else:
-            messages = [SystemMessage(content=SIMPLE_PROMPT)] + state["messages"]
-            response = llm.invoke(messages)
-            
-            return {
-                **state,
-                "messages": [response],
-                "iteration_count": 2,
-                "task_completed": True,
-            }
-    
-    def should_continue(state: AgentState) -> Literal["agent", "end"]:
-        """Check if done."""
-        if state.get("task_completed", False):
-            return "end"
-        if state["iteration_count"] >= 2:  # Max 2 iterations
-            return "end"
-        return "agent"
-    
-    graph.add_node("agent", agent_node)
-    graph.set_entry_point("agent")
-    graph.add_conditional_edges("agent", should_continue, {"agent": "agent", "end": END})
-    
-    return graph.compile()
-
-
-def run_agent(user_input: str, namespace: str = "default") -> str:
-    """Run agent."""
-    logger.info(f"Query: {user_input}")
-    
-    state = create_initial_state(namespace)
-    state["messages"] = [HumanMessage(content=user_input)]
-    
-    graph = create_simple_graph()
-    final_state = graph.invoke(state)
-    
-    # Get last AI message
-    for msg in reversed(final_state.get("messages", [])):
-        if isinstance(msg, AIMessage):
-            text = msg.content
-            # Remove ACTION/INPUT from output
-            text = re.sub(r'^ACTION:.*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
-            text = re.sub(r'^INPUT:.*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
-            cleaned = text.strip()
-            return cleaned if cleaned else msg.content
-    
-    return "❌ No response"
-
-
-def interactive_mode():
-    """CLI mode."""
-    print("🦎 Chameleon-SRE (Fast Mode)")
-    print("=" * 60)
-    print("Simple queries only - one action per question")
-    print("Type 'exit' to quit.")
-    print("=" * 60)
-    print()
-    
-    namespace = input("Kubernetes namespace (default: 'default'): ").strip() or "default"
-    print(f"Operating in namespace: {namespace}\n")
-    
-    while True:
         try:
-            user_input = input("\n🔧 You: ").strip()
-            
-            if not user_input:
-                continue
-            
-            if user_input.lower() in ["exit", "quit", "q"]:
-                print("👋 Goodbye!")
-                break
-            
-            print("\n🦎 Chameleon-SRE:")
-            response = run_agent(user_input, namespace)
-            print(response)
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
-            break
+            if tool_name in tools:
+                result = tools[tool_name].invoke(tool_args)
+                state["last_tool_output"] = result
+                
+                # Add tool result to messages
+                state["messages"].append(ToolMessage(
+                    content=str(result),
+                    tool_call_id=tool_call["id"]
+                ))
+                
+                # If it was a RAG search, store in knowledge context
+                if tool_name == "read_rag_docs":
+                    state["knowledge_context"].append({
+                        "query": tool_args.get("query", ""),
+                        "content": str(result)
+                    })
+            else:
+                error_msg = f"Tool {tool_name} not found"
+                logger.error(error_msg)
+                state["error_log"].append(error_msg)
+                state["messages"].append(ToolMessage(
+                    content=f"ERROR: {error_msg}",
+                    tool_call_id=tool_call["id"]
+                ))
+        
         except Exception as e:
-            logger.error(f"Error: {e}")
-            print(f"❌ Error: {e}")
+            error_msg = f"Tool {tool_name} failed: {str(e)}"
+            logger.error(error_msg)
+            state["error_log"].append(error_msg)
+            state["messages"].append(ToolMessage(
+                content=f"ERROR: {error_msg}",
+                tool_call_id=tool_call["id"]
+            ))
+    
+    return state
 
 
-def main():
-    """Entry point."""
-    setup_logging(verbose=settings.verbose)
-    logger.info("🦎 Chameleon-SRE (Fast Mode) Starting")
-    logger.info(f"Model: {settings.ollama_model}")
-    interactive_mode()
+# ============================================================================
+# Routing Logic
+# ============================================================================
+
+def should_continue_routing(state: AgentState) -> Literal["tools", "end"]:
+    """
+    Determine if agent should continue to tools or end
+    
+    Returns:
+        "tools" if there are tool calls to execute
+        "end" if reasoning is complete
+    """
+    # Check iteration limit
+    if not should_continue(state, MAX_ITERATIONS):
+        logger.info("Reached max iterations or error limit")
+        return "end"
+    
+    # Check if task is marked complete
+    if state["task_complete"]:
+        logger.info("Task marked as complete")
+        return "end"
+    
+    # Check last message for tool calls
+    last_message = state["messages"][-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    
+    return "end"
+
+
+# ============================================================================
+# Graph Construction
+# ============================================================================
+
+def create_agent_graph():
+    """
+    Build the LangGraph state machine
+    
+    Graph structure:
+        START → agent → [tools → agent] (loop) → END
+    
+    The agent can call tools, see results, and reason again in a loop
+    """
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tool_node)
+    
+    # Set entry point
+    workflow.set_entry_point("agent")
+    
+    # Add conditional edges
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue_routing,
+        {
+            "tools": "tools",
+            "end": END
+        }
+    )
+    
+    # Tools always go back to agent for reflection
+    workflow.add_edge("tools", "agent")
+    
+    return workflow.compile()
+
+
+# ============================================================================
+# Agent Execution
+# ============================================================================
+
+def run_agent(user_input: str, verbose: bool = True) -> dict:
+    """
+    Run the agent on a user query
+    
+    Args:
+        user_input: User's request
+        verbose: Whether to print intermediate steps
+    
+    Returns:
+        Final state dictionary
+    """
+    from .state import create_initial_state, format_state_for_display
+    
+    # Create graph
+    graph = create_agent_graph()
+    
+    # Initialize state
+    initial_state = create_initial_state(user_input)
+    
+    if verbose:
+        print("\n🦎 Chameleon-SRE Agent Starting...")
+        print("=" * 60)
+    
+    # Run graph
+    final_state = None
+    for state in graph.stream(initial_state):
+        final_state = state
+        if verbose and "agent" in state:
+            print(format_state_for_display(state["agent"]))
+    
+    if verbose:
+        print("\n✅ Agent Execution Complete")
+        print("=" * 60)
+    
+    # Return the final state from the last key
+    return list(final_state.values())[0] if final_state else initial_state
 
 
 if __name__ == "__main__":
-    main()
+    # Test the agent
+    logging.basicConfig(level=logging.INFO)
+    
+    test_query = "Check if there are any pods in CrashLoopBackOff state and fix them"
+    result = run_agent(test_query)
+    
+    print("\n📋 Final Agent Response:")
+    print(result["messages"][-1].content if result["messages"] else "No response")
