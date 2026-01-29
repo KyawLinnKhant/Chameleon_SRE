@@ -263,14 +263,6 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ---
 
-## 🙏 Acknowledgments
-
-- **LangChain Team**: For the incredible LangGraph framework
-- **Ollama**: For making local LLMs accessible
-- **Anthropic**: For Claude (used to design this architecture 😉)
-
----
-
 ## 📧 Contact
 
 - **Author**: Kyaw Linn Khant
